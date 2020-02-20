@@ -559,7 +559,15 @@ void CodeGenFunction::EmitEndEHSpec(const Decl *D) {
 
 void CodeGenFunction::EmitCXXTryStmt(const CXXTryStmt &S) {
   EnterCXXTryStmt(S);
-  EmitStmt(S.getTryBlock());
+  {
+    RunCleanupsScope RCS(*this);
+    // If Cilk, add implicit sync at the end of a try-block
+    const LangOptions &LO = CGM.getLangOpts();
+    if (LO.Cilk) {
+      EHStack.pushCleanup<ImplicitSyncCleanup>(NormalCleanup);
+    }
+    EmitStmt(S.getTryBlock());
+  }
   ExitCXXTryStmt(S);
 }
 
