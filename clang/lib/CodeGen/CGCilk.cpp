@@ -122,18 +122,9 @@ void CodeGenFunction::DetachScope::RestoreDetachScope() {
 }
 
 void CodeGenFunction::DetachScope::PushSpawnedTaskTerminate() {
-  // TODO: Replace this cleanup with the actual cleanup we want.
-  CGF.pushFullExprCleanupImpl<ImplicitSyncCleanup>(
-      EHCleanup, CGF.CurSyncRegion->getSyncRegionStart());
-
-  // Create an EH scope for catching exceptions from the detached task.
-  // Ultimately, the detached task might be outlined into a separate helper
-  // function.  Hence, if an exception might propagate from the task to its
-  // parent, then it needs to be rethrown from this helper.  The
-  // detached-rethrow handler models this pattern of rethrowing the exception
-  // before outlining occurs.
-  EHCatchScope *CatchScope = CGF.EHStack.pushCatch(1);
-  CatchScope->setCatchAllHandler(0, DetRethrow.get());
+  CGF.pushFullExprCleanupImpl<CallDetRethrow>(
+      static_cast<CleanupKind>(EHCleanup | LifetimeMarker),
+      CGF.CurSyncRegion->getSyncRegionStart());
 }
 
 void CodeGenFunction::DetachScope::StartDetach() {
@@ -207,7 +198,7 @@ void CodeGenFunction::DetachScope::FinishDetach() {
          "Attempted to finish a detach that was not started.");
 
   CleanupDetach();
-  CGF.popCatchScope();
+  CGF.PopCleanupBlock();
 
   // The CFG path into the spawned statement should terminate with a `reattach'.
   if (CGF.HaveInsertPoint())
@@ -230,14 +221,15 @@ void CodeGenFunction::DetachScope::FinishDetach() {
   CGF.EHSelectorSlot = OldEHSelectorSlot;
   CGF.NormalCleanupDest = OldNormalCleanupDest;
 
+  if (TempInvokeDest)
+    TempInvokeDest->replaceAllUsesWith(CGF.getInvokeDest());
+
   // Emit the continue block.
   CGF.EmitBlock(ContinueBlock);
 
-  DetRethrow.emitIfUsed(DetExnSlot, DetSelSlot,
-                        CGF.CurSyncRegion->getSyncRegionStart());
   // If the detached-rethrow handler is used, add an unwind destination to the
   // detach.
-  if (DetRethrow.isUsed()) {
+  if (CGF.getInvokeDest()) {
     CGBuilderTy::InsertPoint SavedIP = CGF.Builder.saveIP();
     CGF.Builder.SetInsertPoint(Detach);
     // Create the new detach instruction.
