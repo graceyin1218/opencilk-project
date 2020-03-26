@@ -120,6 +120,7 @@ void CodeGenFunction::DetachScope::PushSpawnedTaskTerminate() {
 }
 
 void CodeGenFunction::DetachScope::StartDetach() {
+  printf("Start detach\n");
   InitDetachScope();
 
   // Set the detached block as the new alloca insertion point.
@@ -224,6 +225,7 @@ static void EmitTrivialLandingPad(CodeGenFunction &CGF,
 }
 
 void CodeGenFunction::DetachScope::FinishDetach() {
+  printf("Finish detach\n");
   assert(DetachStarted &&
          "Attempted to finish a detach that was not started.");
   CleanupDetach();
