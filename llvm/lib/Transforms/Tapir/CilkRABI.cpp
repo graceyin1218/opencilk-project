@@ -14,6 +14,7 @@
 #include "llvm/Transforms/Tapir/CilkRABI.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/TapirTaskInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -996,13 +997,45 @@ void CilkRABI::lowerSync(SyncInst &SI) {
 
   Value *SF = GetOrInitCilkStackFrame(Fn, /*Helper*/false);
   Value *Args[] = { SF };
-  assert(Args[0] && "sync used in function without frame!");
-  CallInst *CI = CallInst::Create(GetCilkSyncFn(), Args, "",
-                                  /*insert before*/&SI);
-  CI->setDebugLoc(SI.getDebugLoc());
   BasicBlock *Succ = SI.getSuccessor(0);
-  SI.eraseFromParent();
-  BranchInst::Create(Succ, CI->getParent());
+
+  if (SyncToUnwindDest[&SI]) {
+    assert(Args[0] && "sync used in function without frame!");
+    Value* UnwindDest = SyncToUnwindDest[&SI];
+    /*
+    TODO: perhaps we should still create our own landingpad that just forwards
+          you to the correct catch block... this would help us avoid any
+          awkward cleanup issues. (like, accidentally rerunning a cleanup...)
+
+    // Create a cleanup landingpad that does nothing.
+    // (mimics what EscapeEnumerator does)
+    Function *F = SI.getFunction();
+    LLVMContext &C = F->getContext();
+    BasicBlock *CleanupBB = BasicBlock::Create(C, "sync.unwind.dest", F);
+    Type *ExnTy = StructType::get(Type::getInt8PtrTy(C), Type::getInt32Ty(C));
+    // should always have a personality function
+    assert(F->hasPersonalityFn() &&
+           "sync that may throw used in a function without a personality function");
+    LandingPadInst *LPad =
+      LandingPadInst::Create(ExnTy, 1, "sync.cleanup.lpad", CleanupBB);
+    LPad->setCleanup(true);
+    ResumeInst *RI = ResumeInst::Create(LPad, CleanupBB);
+    */
+
+    InvokeInst *II = InvokeInst::Create(GetCilkSyncFn(), Succ,
+                                        static_cast<BasicBlock*>(UnwindDest),
+                                        //CleanupBB,
+                                        Args, "", /*insert before*/&SI);
+    II->setDebugLoc(SI.getDebugLoc());
+    SI.eraseFromParent();
+  } else {
+    assert(Args[0] && "sync used in function without frame!");
+    CallInst *CI = CallInst::Create(GetCilkSyncFn(), Args, "",
+                                    /*insert before*/&SI);
+    CI->setDebugLoc(SI.getDebugLoc());
+    SI.eraseFromParent();
+    BranchInst::Create(Succ, CI->getParent());
+  }
   // Mark this function as stealable.
   Fn.addFnAttr(Attribute::Stealable);
 }
@@ -1078,11 +1111,69 @@ static inline void inlineCilkFunctions(Function &F) {
     llvm_unreachable("Tapir->CilkABI lowering produced bad IR!");
 }
 
+void CilkRABI::setSyncToUnwindDest(Function &F, TaskInfo &TI) {
+  // If any task within a sync region might throw an exception, then cilk_sync
+  // may need to rethrow that exception. (i.e. it will need to be invoked and
+  // given an unwind destination)
+
+  if (TI.isSerial()) return;
+  MaybeParallelTasks MPTasks;
+  TI.evaluateParallelState<MaybeParallelTasks>(MPTasks);
+
+  // fill in SyncToUnwindDest
+  for (Task *T : post_order(TI.getRootTask())) {
+    if (T->isSerial()) {
+      continue;
+    }
+
+    // find all syncs
+    for (Spindle *S : T->spindles()) {
+      for (Spindle::SpindleEdge &Edge : S->out_edges()) {
+        if (SyncInst *SI = dyn_cast<SyncInst>(Edge.second->getTerminator())) {
+          Value *SyncR = SI->getSyncRegion();
+          // find tasks that may be run in parallel
+          for (const Task *MPTask : MPTasks.TaskList[S]) {
+            DetachInst *DI = MPTask->getDetach();
+            // if the detach belongs to the same sync region and has an
+            // unwind dest, save either the unwind dest of the DetachInst or
+            // the unwind dest of the taskframe.resume (with a preference for
+            // the taskframe.resume)
+            if (SyncR == DI->getSyncRegion() && DI->hasUnwindDest()) {
+              Value *TaskFrame = MPTask->getTaskFrameUsed();
+              if (TaskFrame) {
+                // go through all uses to find the taskframe.resume
+                for (auto i = TaskFrame->use_begin(), e = TaskFrame->use_end();
+                     i != e; ++i) {
+                  // only taskframe.resumes should be invoked.
+                  if (InvokeInst *II = dyn_cast<InvokeInst>(i->getUser())) {
+                    if (II->getIntrinsicID() != Intrinsic::taskframe_resume)
+                      continue;
+                    SyncToUnwindDest[SI] = II->getUnwindDest();
+                    break;
+                  }
+                }
+              } else {
+                SyncToUnwindDest[SI] = DI->getUnwindDest();
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (verifyFunction(F, &errs()))
+    llvm_unreachable("Tapir->CilkRABI set sync unwind dest produced bad IR!");
+}
+
 void CilkRABI::preProcessFunction(Function &F, TaskInfo &TI,
                                   bool OutliningTapirLoops) {
   if (OutliningTapirLoops)
     // Don't do any preprocessing when outlining Tapir loops.
     return;
+
+  setSyncToUnwindDest(F, TI);
 
   if (F.getName() == "main")
     F.setName("cilk_main");

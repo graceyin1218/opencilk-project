@@ -22,6 +22,7 @@ class TapirLoopInfo;
 
 class CilkRABI : public TapirTarget {
   ValueToValueMapTy DetachCtxToStackFrame;
+  ValueToValueMapTy SyncToUnwindDest;
 
   // Cilk RTS data types
   StructType *StackFrameTy = nullptr;
@@ -82,6 +83,7 @@ class CilkRABI : public TapirTarget {
   CallInst *EmitCilkSetJmp(IRBuilder<> &B, Value *SF);
   bool makeFunctionDetachable(Function &Extracted, Instruction *DetachPt,
                               Instruction *TaskFrameCreate);
+  void setSyncToUnwindDest(Function &F, TaskInfo &TI);
 
 public:
   CilkRABI(Module &M);
